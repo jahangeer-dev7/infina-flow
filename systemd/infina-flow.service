@@ -1,14 +1,15 @@
 [Unit]
 Description=InfinaFlow - Linux Native Hands-Free Voice Assistant
-After=pipewire.service
+After=graphical-session.target pipewire.service
+PartOf=graphical-session.target
 
 [Service]
 Type=simple
 ExecStart=/home/jk/.local/bin/infina-flow
 Restart=always
-RestartSec=2
-StandardOutput=journal
-StandardError=journal
+RestartSec=3
+PassEnvironment=WAYLAND_DISPLAY XDG_RUNTIME_DIR HYPRLAND_INSTANCE_SIGNATURE
+EnvironmentFile=-%h/.config/infina-flow/infina.env
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target default.target
