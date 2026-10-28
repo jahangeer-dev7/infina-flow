@@ -451,6 +451,17 @@ class InfinaEngine:
             return True
 
         if action == "close_window":
+            # Safety guard: in web browsers, "close" defaults to closing tab (Ctrl+W) unless explicitly requested
+            try:
+                r = subprocess.run(["hyprctl", "activewindow", "-j"], capture_output=True, text=True)
+                act_class = (json.loads(r.stdout).get("class", "") if r.stdout else "").lower()
+            except Exception:
+                act_class = ""
+            if any(b in act_class for b in ["chrome", "chromium", "firefox", "brave"]):
+                subprocess.run(["wtype", "-M", "ctrl", "-k", "w", "-m", "ctrl"])
+                play_sound(ACTION_CHIME)
+                set_hud_state("listening", 0.2)
+                return True
             subprocess.run(["hyprctl", "dispatch", "hl.dsp.window.close()"], capture_output=True)
             play_sound(ACTION_CHIME)
             set_hud_state("listening", 0.2)
@@ -473,15 +484,15 @@ class InfinaEngine:
 
         # Browser shortcuts
         browser_map = {
-            "new_tab": ["wtype", "-M", "ctrl", "t", "-m", "ctrl"],
-            "close_tab": ["wtype", "-M", "ctrl", "w", "-m", "ctrl"],
-            "reopen_tab": ["wtype", "-M", "ctrl", "-M", "shift", "t", "-m", "shift", "-m", "ctrl"],
-            "restore_tabs": ["wtype", "-M", "ctrl", "-M", "shift", "t", "-m", "shift", "-m", "ctrl"],
+            "new_tab": ["wtype", "-M", "ctrl", "-k", "t", "-m", "ctrl"],
+            "close_tab": ["wtype", "-M", "ctrl", "-k", "w", "-m", "ctrl"],
+            "reopen_tab": ["wtype", "-M", "ctrl", "-M", "shift", "-k", "t", "-m", "shift", "-m", "ctrl"],
+            "restore_tabs": ["wtype", "-M", "ctrl", "-M", "shift", "-k", "t", "-m", "shift", "-m", "ctrl"],
             "next_tab": ["wtype", "-M", "ctrl", "-k", "Tab", "-m", "ctrl"],
             "prev_tab": ["wtype", "-M", "ctrl", "-M", "shift", "-k", "Tab", "-m", "shift", "-m", "ctrl"],
             "go_back": ["wtype", "-M", "alt", "-k", "Left", "-m", "alt"],
             "go_forward": ["wtype", "-M", "alt", "-k", "Right", "-m", "alt"],
-            "refresh": ["wtype", "-M", "ctrl", "r", "-m", "ctrl"],
+            "refresh": ["wtype", "-M", "ctrl", "-k", "r", "-m", "ctrl"],
             "scroll_down": ["wtype", "-k", "Page_Down"],
             "scroll_up": ["wtype", "-k", "Page_Up"],
         }
