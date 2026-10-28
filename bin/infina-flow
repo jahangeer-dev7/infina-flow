@@ -57,7 +57,7 @@ for ef in env_files:
                     line = line.strip()
                     if line.startswith("#") or not line:
                         continue
-                    if "GROQ_API_KEY" in line and not GROQ_API_KEY:
+                    if ("GROQ_API_KEY" in line or "VOXTYPE_WHISPER_API_KEY" in line) and not GROQ_API_KEY:
                         GROQ_API_KEY = line.split("=", 1)[1].strip("\"' ")
                     elif "NVIDIA_API_KEY" in line and not NVIDIA_API_KEY:
                         NVIDIA_API_KEY = line.split("=", 1)[1].strip("\"' ")
