@@ -284,13 +284,17 @@ Map the user's spoken words into a clean JSON action:
 - "workspace": Switch to workspace N. Keys: "action": "workspace", "target": "<1-10>"
 - "move_to_workspace": Move active window to workspace N. Keys: "action": "move_to_workspace", "target": "<1-10>"
 - "focus_app": Switch or launch app. Keys: "action": "focus_app", "target": "<app name>"
-- "close_window": Close active window. Keys: "action": "close_window"
-- "browser": Web browser control. Keys: "action": "new_tab"|"close_tab"|"next_tab"|"prev_tab"|"go_back"|"go_forward"|"refresh"|"scroll_down"|"scroll_up"
+- "close_window": Close entire window. ONLY when user explicitly says "close window", "close app", "close Chrome".
+- "browser": Web browser control:
+  - "new_tab": create/open tab
+  - "close_tab": close current tab (default when in browser and user says "close tab" or "close this")
+  - "reopen_tab": restore old/closed tabs ("restore the old tabs", "reopen tab", "restore closed tabs", "restore the old taps")
+  - "next_tab", "prev_tab", "go_back", "go_forward", "refresh", "scroll_down", "scroll_up"
 - "media": Audio control. Keys: "action": "volume_up"|"volume_down"|"mute"|"play_pause"|"next_track"|"prev_track"
-- "clear": Delete input text. Keys: "action": "clear"
-- "dismiss": Go to sleep/close assistant. Keys: "action": "dismiss"
+- "clear": Delete active input text. Keys: "action": "clear"
+- "dismiss": Put assistant to sleep. ONLY when user explicitly says "close assistant", "goodbye", "thank you", "bye", "go to sleep". NEVER pick dismiss for browser or window commands!
 
-Respond ONLY with valid JSON."""
+Respond ONLY with valid JSON: {{"action": "...", "target": "...", "text": "...", "send_it": false}}"""
 
 
 def query_llm_intent(user_speech: str, active_win: str, running_apps: list[str]) -> dict | None:
@@ -471,6 +475,8 @@ class InfinaEngine:
         browser_map = {
             "new_tab": ["wtype", "-M", "ctrl", "t", "-m", "ctrl"],
             "close_tab": ["wtype", "-M", "ctrl", "w", "-m", "ctrl"],
+            "reopen_tab": ["wtype", "-M", "ctrl", "-M", "shift", "t", "-m", "shift", "-m", "ctrl"],
+            "restore_tabs": ["wtype", "-M", "ctrl", "-M", "shift", "t", "-m", "shift", "-m", "ctrl"],
             "next_tab": ["wtype", "-M", "ctrl", "-k", "Tab", "-m", "ctrl"],
             "prev_tab": ["wtype", "-M", "ctrl", "-M", "shift", "-k", "Tab", "-m", "shift", "-m", "ctrl"],
             "go_back": ["wtype", "-M", "alt", "-k", "Left", "-m", "alt"],
@@ -479,8 +485,9 @@ class InfinaEngine:
             "scroll_down": ["wtype", "-k", "Page_Down"],
             "scroll_up": ["wtype", "-k", "Page_Up"],
         }
-        if action in browser_map:
-            subprocess.run(browser_map[action])
+        b_key = action if action in browser_map else (target if action == "browser" and target in browser_map else None)
+        if b_key:
+            subprocess.run(browser_map[b_key])
             play_sound(ACTION_CHIME)
             set_hud_state("listening", 0.2)
             return True
@@ -494,8 +501,9 @@ class InfinaEngine:
             "next_track": ["wtype", "-k", "XF86AudioNext"],
             "prev_track": ["wtype", "-k", "XF86AudioPrev"],
         }
-        if action in media_map:
-            subprocess.run(media_map[action], capture_output=True)
+        m_key = action if action in media_map else (target if action == "media" and target in media_map else None)
+        if m_key:
+            subprocess.run(media_map[m_key], capture_output=True)
             play_sound(ACTION_CHIME)
             set_hud_state("listening", 0.2)
             return True
