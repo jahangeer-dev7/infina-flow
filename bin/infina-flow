@@ -1,0 +1,659 @@
+#!/home/jk/.local/share/vox-handsfree-venv/bin/python
+"""InfinaFlow - Linux Native Hands-Free Voice Assistant for Omarchy Linux / Hyprland.
+
+Architecture:
+1. Wake-word: openWakeWord ('hey_jarvis' ONNX model, running on-device <1% CPU).
+2. STT: Groq Whisper Large v3 Turbo (~250ms latency).
+3. Intent Routing (Multi-tier fallback):
+   - Tier 1: NVIDIA NIM (OpenAI-compatible) if NVIDIA_API_KEY is configured.
+   - Tier 2: Groq LPU Cloud LLM (Qwen/Llama) if GROQ_API_KEY is available (~180ms).
+   - Tier 3: Local Deterministic & Fuzzy Matcher (offline safe, instant).
+4. OS Actions: Hyprland Lua dispatch + Omarchy commands + wtype keyboard injection.
+5. Visual HUD: Quickshell Siri Wave Line at the bottom edge of the screen.
+"""
+
+import io
+import json
+import os
+import re
+import sys
+import time
+import wave
+import subprocess
+import urllib.request
+import urllib.error
+import difflib
+import numpy as np
+
+VENV_PATH = os.path.expanduser("~/.local/share/vox-handsfree-venv")
+if os.path.exists(VENV_PATH):
+    sys.path.insert(0, os.path.join(VENV_PATH, "lib/python3.14/site-packages"))
+
+import sounddevice as sd
+from openwakeword.model import Model as OwwModel
+
+# --- Audio Feedback Files ---
+WAKE_CHIME = "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga"
+ACTION_CHIME = "/usr/share/sounds/freedesktop/stereo/complete.oga"
+CLOSE_CHIME = "/usr/share/sounds/freedesktop/stereo/device-removed.oga"
+
+HUD_DIR = os.path.expanduser("~/.local/share/infina-flow/hud")
+STATE_FILE = f"/run/user/{os.getuid()}/infina/state"
+
+# --- API Keys Loading ---
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY")
+
+env_files = [
+    os.path.expanduser("~/.config/voxtype/voxtype.env"),
+    os.path.expanduser("~/.config/infina-flow/infina.env"),
+    "/etc/infina-flow.env",
+]
+for ef in env_files:
+    if os.path.exists(ef):
+        try:
+            with open(ef, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("#") or not line:
+                        continue
+                    if "GROQ_API_KEY" in line and not GROQ_API_KEY:
+                        GROQ_API_KEY = line.split("=", 1)[1].strip("\"' ")
+                    elif "NVIDIA_API_KEY" in line and not NVIDIA_API_KEY:
+                        NVIDIA_API_KEY = line.split("=", 1)[1].strip("\"' ")
+        except Exception:
+            pass
+
+if not GROQ_API_KEY:
+    print("[InfinaEngine] Warning: GROQ_API_KEY not found in environment or config files.", file=sys.stderr)
+# --- Application Name & Class Mappings ---
+APP_ALIASES = {
+    "paseo": "Paseo", "paceo": "Paseo", "pco": "Paseo", "paso": "Paseo",
+    "chrome": "google-chrome", "google chrome": "google-chrome", "croom": "google-chrome", "browser": "google-chrome",
+    "terminal": "foot", "term": "foot", "console": "foot",
+    "calc": "libreoffice-calc", "excel": "libreoffice-calc", "librecalc": "libreoffice-calc", "spreadsheet": "libreoffice-calc",
+    "word": "libreoffice-writer", "writer": "libreoffice-writer",
+    "cursor": "Cursor", "code": "code", "vs code": "code",
+    "files": "nautilus", "file manager": "nautilus",
+    "calculator": "omacalc", "obsidian": "obsidian", "spotify": "Spotify",
+}
+
+LAUNCH_COMMANDS = {
+    "Paseo": ["omarchy", "launch", "openclaw"],
+    "google-chrome": ["omarchy", "launch", "browser"],
+    "foot": ["omarchy", "launch", "terminal"],
+    "libreoffice-calc": ["libreoffice", "--calc"],
+    "libreoffice-writer": ["libreoffice", "--writer"],
+    "omacalc": ["omacalc"],
+    "Cursor": ["cursor"],
+    "code": ["code"],
+    "nautilus": ["nautilus"],
+    "obsidian": ["obsidian"],
+}
+
+WORD_TO_NUM = {
+    "one": "1", "1": "1", "first": "1",
+    "two": "2", "to": "2", "too": "2", "2": "2", "second": "2",
+    "three": "3", "3": "3", "third": "3",
+    "four": "4", "for": "4", "fore": "4", "4": "4", "fourth": "4",
+    "five": "5", "5": "5", "fifth": "5",
+    "six": "6", "6": "6", "sixth": "6",
+    "seven": "7", "7": "7", "seventh": "7",
+    "eight": "8", "ate": "8", "8": "8", "eighth": "8",
+    "nine": "9", "9": "9", "ninth": "9",
+    "ten": "10", "10": "10", "tenth": "10",
+}
+
+
+def set_hud_state(state: str, level: float = 0.0):
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, "w") as f:
+            f.write(json.dumps({"state": state, "level": round(level, 3)}))
+    except Exception:
+        pass
+
+
+def play_sound(path):
+    if os.path.exists(path):
+        subprocess.Popen(["pw-play", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def focus_window_by_address(address: str) -> bool:
+    """Focus Hyprland window via native Lua dispatch."""
+    r = subprocess.run(
+        ["hyprctl", "dispatch", f'hl.dsp.focus({{ window = "address:{address}" }})'],
+        capture_output=True, text=True
+    )
+    if r.returncode == 0 and "error" not in (r.stderr or "").lower() and "error" not in (r.stdout or "").lower():
+        return True
+    return False
+
+
+def get_running_windows() -> list[dict]:
+    try:
+        r = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True)
+        return json.loads(r.stdout) if r.stdout else []
+    except Exception:
+        return []
+
+
+def focus_or_launch(spoken_target: str) -> tuple[bool, str]:
+    raw = spoken_target.strip().lower()
+    if not raw:
+        return False, ""
+    cleaned = re.sub(r"\b(?:the|a|an|my|app|tab|window|already\s+opened?|existing|running)\b", "", raw).strip()
+    resolved = APP_ALIASES.get(cleaned, cleaned)
+    clients = get_running_windows()
+
+    # Match by Class
+    for c in clients:
+        c_class = (c.get("class") or "").lower()
+        if resolved.lower() in c_class or cleaned in c_class:
+            if focus_window_by_address(c.get("address", "")):
+                return True, c.get("class") or cleaned.capitalize()
+
+    # Match by Title (exclude terminal titles)
+    for c in clients:
+        c_class = (c.get("class") or "").lower()
+        c_title = (c.get("title") or "").lower()
+        if any(t in c_class for t in ["foot", "alacritty", "kitty", "terminal"]):
+            continue
+        if resolved.lower() in c_title or cleaned in c_title:
+            if focus_window_by_address(c.get("address", "")):
+                return True, c.get("class") or cleaned.capitalize()
+
+    # Fuzzy Match
+    if clients:
+        classes = list({c.get("class") for c in clients if c.get("class")})
+        close = difflib.get_close_matches(resolved, classes, n=1, cutoff=0.5)
+        if close:
+            for c in clients:
+                if c.get("class") == close[0]:
+                    if focus_window_by_address(c.get("address", "")):
+                        return True, close[0]
+
+    # Omarchy launcher fallback
+    r = subprocess.run(["omarchy", "hyprland", "focus", "app", resolved], capture_output=True, text=True)
+    if r.returncode == 0:
+        return True, resolved
+
+    # Not running -> Launch
+    if resolved in LAUNCH_COMMANDS:
+        subprocess.Popen(LAUNCH_COMMANDS[resolved], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        return True, resolved
+
+    import shutil
+    if shutil.which(cleaned):
+        subprocess.Popen([cleaned], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        return True, cleaned.capitalize()
+
+    return False, ""
+
+
+def transcribe_groq(audio_bytes: bytes) -> str:
+    """Fast Speech-to-Text via Groq Whisper Large v3 Turbo (~250ms)."""
+    if not audio_bytes or len(audio_bytes) < 3200:
+        return ""
+
+    wav_io = io.BytesIO()
+    with wave.open(wav_io, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(audio_bytes)
+    wav_data = wav_io.getvalue()
+
+    boundary = "----GroqBoundaryInfinaFlow"
+    body = (
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n"
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\nen\r\n"
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n"
+        "Arch Linux, Hyprland, Omarchy, Chrome, Terminal, Cursor, Discord, Claude, Paseo, Python, TypeScript, "
+        "workspace, open, close, type, send it, clear it, focus, screenshot, new line\r\n"
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"speech.wav\"\r\n"
+        "Content-Type: audio/wav\r\n\r\n"
+    ).encode("utf-8") + wav_data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "Mozilla/5.0",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("text", "").strip()
+    except Exception as e:
+        print(f"[InfinaFlow] Groq transcription error: {e}", file=sys.stderr)
+        return ""
+
+
+def paste_or_type(text: str):
+    """Accurately types into Terminal prompts or pastes into GUI applications."""
+    if not text:
+        return
+
+    try:
+        res = subprocess.run(["hyprctl", "activewindow", "-j"], capture_output=True, text=True)
+        win_info = json.loads(res.stdout) if res.stdout else {}
+        win_class = win_info.get("class", "").lower()
+    except Exception:
+        win_class = ""
+
+    is_terminal = any(t in win_class for t in ["foot", "alacritty", "kitty", "terminal", "wezterm", "xterm"])
+
+    if is_terminal and "\n" not in text:
+        subprocess.run(["wtype", "-d", "2", text])
+    elif is_terminal:
+        p = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
+        p.communicate(input=text.encode("utf-8"))
+        time.sleep(0.08)
+        subprocess.run(["wtype", "-M", "ctrl", "-M", "shift", "v", "-m", "shift", "-m", "ctrl"])
+    else:
+        p = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
+        p.communicate(input=text.encode("utf-8"))
+        time.sleep(0.08)
+        subprocess.run(["wtype", "-M", "ctrl", "v", "-m", "ctrl"])
+
+
+def press_return():
+    time.sleep(0.12)
+    subprocess.run(["wtype", "-k", "Return"])
+
+
+def clear_input():
+    subprocess.run(["wtype", "-M", "ctrl", "a", "-m", "ctrl"])
+    time.sleep(0.06)
+    subprocess.run(["wtype", "-k", "BackSpace"])
+
+
+# --- LLM INTENT ROUTER WITH MULTI-TIER FALLBACK ---
+
+SYSTEM_INTENT_PROMPT = """You are a high-speed Linux desktop voice intent classifier.
+Active window: {active_win}
+Running apps: {running_apps}
+
+Map the user's spoken words into a clean JSON action:
+- "type": User wants to write or dictate text. Keys: "action": "type", "text": "<clean text>", "send_it": true/false
+- "workspace": Switch to workspace N. Keys: "action": "workspace", "target": "<1-10>"
+- "move_to_workspace": Move active window to workspace N. Keys: "action": "move_to_workspace", "target": "<1-10>"
+- "focus_app": Switch or launch app. Keys: "action": "focus_app", "target": "<app name>"
+- "close_window": Close active window. Keys: "action": "close_window"
+- "browser": Web browser control. Keys: "action": "new_tab"|"close_tab"|"next_tab"|"prev_tab"|"go_back"|"go_forward"|"refresh"|"scroll_down"|"scroll_up"
+- "media": Audio control. Keys: "action": "volume_up"|"volume_down"|"mute"|"play_pause"|"next_track"|"prev_track"
+- "clear": Delete input text. Keys: "action": "clear"
+- "dismiss": Go to sleep/close assistant. Keys: "action": "dismiss"
+
+Respond ONLY with valid JSON."""
+
+
+def query_llm_intent(user_speech: str, active_win: str, running_apps: list[str]) -> dict | None:
+    """Queries NVIDIA NIM (Tier 1) -> Groq LPU (Tier 2). Returns parsed JSON dict or None."""
+    sys_prompt = SYSTEM_INTENT_PROMPT.format(active_win=active_win, running_apps=running_apps)
+    messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": user_speech}
+    ]
+
+    # Tier 1: NVIDIA NIM
+    if NVIDIA_API_KEY:
+        try:
+            url = "https://integrate.api.nvidia.com/v1/chat/completions"
+            payload = {
+                "model": "nvidia/llama-3.1-nemotron-70b-instruct",
+                "messages": messages,
+                "temperature": 0.0,
+                "max_tokens": 120,
+                "response_format": {"type": "json_object"}
+            }
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Authorization": f"Bearer {NVIDIA_API_KEY}", "Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                content = json.loads(resp.read().decode())["choices"][0]["message"]["content"]
+                return json.loads(content)
+        except Exception as e:
+            print(f"[InfinaEngine] Tier 1 (NVIDIA NIM) fallback: {e}", file=sys.stderr)
+
+    # Tier 2: Groq Cloud LPU (Qwen / Llama)
+    if GROQ_API_KEY:
+        try:
+            url = "https://api.groq.com/openai/v1/chat/completions"
+            payload = {
+                "model": "qwen/qwen3.8-27b",
+                "messages": messages,
+                "temperature": 0.0,
+                "max_tokens": 120,
+                "response_format": {"type": "json_object"}
+            }
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                content = json.loads(resp.read().decode())["choices"][0]["message"]["content"]
+                return json.loads(content)
+        except Exception as e:
+            print(f"[InfinaEngine] Tier 2 (Groq LLM) fallback: {e}", file=sys.stderr)
+
+    return None
+
+
+class InfinaEngine:
+    def __init__(self, wake_word="hey_jarvis", threshold=0.50):
+        self.wake_word = wake_word
+        self.threshold = threshold
+
+        print(f"[InfinaEngine] Loading openWakeWord for '{self.wake_word}'...", flush=True)
+        import openwakeword
+        res_dir = os.path.join(os.path.dirname(openwakeword.__file__), "resources/models")
+        target_path = None
+        for f in os.listdir(res_dir):
+            if f.startswith(self.wake_word) and f.endswith(".onnx"):
+                target_path = os.path.join(res_dir, f)
+                break
+        self.oww = OwwModel(wakeword_model_paths=[target_path]) if target_path else OwwModel()
+        self.model_key = list(self.oww.models.keys())[0]
+
+        self.ensure_hud()
+
+        self.state = "IDLE"
+        self.last_speech_time = 0
+        self.last_activity_time = 0
+        self.cooldown_until = 0
+
+        self.audio_frames = bytearray()
+        self.has_spoken = False
+        self.ambient_rms = 100.0
+
+    def ensure_hud(self):
+        try:
+            r = subprocess.run(["pgrep", "-f", "infina-flow/hud"], capture_output=True, text=True)
+            if not r.stdout.strip():
+                print("[InfinaEngine] Launching Siri Wave Line HUD...", flush=True)
+                subprocess.Popen(["qs", "-p", HUD_DIR], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"[InfinaEngine] HUD error: {e}", file=sys.stderr)
+
+    def reset_wakeword(self):
+        try:
+            self.oww.reset()
+            self.oww.preprocessor.raw_data_buffer.clear()
+            self.oww.preprocessor.melspectrogram_buffer.fill(0)
+            self.oww.preprocessor.feature_buffer.fill(0)
+            self.oww.preprocessor.accumulated_samples = 0
+        except Exception:
+            pass
+
+    def on_wake(self):
+        print(f"\n[InfinaEngine] Activated! Siri Wave Line awake.", flush=True)
+        play_sound(WAKE_CHIME)
+        set_hud_state("connecting", 0.3)
+        time.sleep(0.12)
+        set_hud_state("listening", 0.5)
+        self.state = "LISTENING"
+        self.last_activity_time = time.time()
+        self.last_speech_time = time.time()
+        self.has_spoken = False
+        self.audio_frames.clear()
+
+    def on_dismiss(self):
+        print("[InfinaEngine] Dismissed. Going to sleep.", flush=True)
+        play_sound(CLOSE_CHIME)
+        set_hud_state("disabled", 0.0)
+        self.state = "COOLDOWN"
+        self.cooldown_until = time.time() + 1.5
+        self.reset_wakeword()
+        self.audio_frames.clear()
+
+    def execute_llm_action(self, decision: dict) -> bool:
+        """Executes a JSON action decided by NVIDIA or Groq LLM."""
+        action = decision.get("action")
+        target = decision.get("target")
+        text = decision.get("text")
+        send_it = decision.get("send_it", False)
+
+        if action == "dismiss":
+            self.on_dismiss()
+            return True
+
+        if action == "focus_app" and target:
+            ok, label = focus_or_launch(target)
+            play_sound(ACTION_CHIME if ok else CLOSE_CHIME)
+            set_hud_state("listening", 0.2)
+            return True
+
+        if action == "workspace" and target:
+            ws = WORD_TO_NUM.get(str(target).lower(), str(target))
+            subprocess.run(["hyprctl", "dispatch", f'hl.dsp.focus({{ workspace = "{ws}" }})'], capture_output=True)
+            play_sound(ACTION_CHIME)
+            set_hud_state("listening", 0.2)
+            return True
+
+        if action == "move_to_workspace" and target:
+            ws = WORD_TO_NUM.get(str(target).lower(), str(target))
+            subprocess.run(["hyprctl", "dispatch", f'hl.dsp.window.move({{ workspace = "{ws}" }})'], capture_output=True)
+            play_sound(ACTION_CHIME)
+            set_hud_state("listening", 0.2)
+            return True
+
+        if action == "close_window":
+            subprocess.run(["hyprctl", "dispatch", "hl.dsp.window.close()"], capture_output=True)
+            play_sound(ACTION_CHIME)
+            set_hud_state("listening", 0.2)
+            return True
+
+        if action == "clear":
+            clear_input()
+            play_sound(ACTION_CHIME)
+            set_hud_state("listening", 0.2)
+            return True
+
+        if action == "type" and text:
+            set_hud_state("speaking", 0.5)
+            paste_or_type(text)
+            if send_it:
+                press_return()
+            play_sound(ACTION_CHIME)
+            set_hud_state("listening", 0.1)
+            return True
+
+        # Browser shortcuts
+        browser_map = {
+            "new_tab": ["wtype", "-M", "ctrl", "t", "-m", "ctrl"],
+            "close_tab": ["wtype", "-M", "ctrl", "w", "-m", "ctrl"],
+            "next_tab": ["wtype", "-M", "ctrl", "-k", "Tab", "-m", "ctrl"],
+            "prev_tab": ["wtype", "-M", "ctrl", "-M", "shift", "-k", "Tab", "-m", "shift", "-m", "ctrl"],
+            "go_back": ["wtype", "-M", "alt", "-k", "Left", "-m", "alt"],
+            "go_forward": ["wtype", "-M", "alt", "-k", "Right", "-m", "alt"],
+            "refresh": ["wtype", "-M", "ctrl", "r", "-m", "ctrl"],
+            "scroll_down": ["wtype", "-k", "Page_Down"],
+            "scroll_up": ["wtype", "-k", "Page_Up"],
+        }
+        if action in browser_map:
+            subprocess.run(browser_map[action])
+            play_sound(ACTION_CHIME)
+            set_hud_state("listening", 0.2)
+            return True
+
+        # Media shortcuts
+        media_map = {
+            "volume_up": ["omarchy", "audio", "output", "volume", "raise"],
+            "volume_down": ["omarchy", "audio", "output", "volume", "lower"],
+            "mute": ["omarchy", "audio", "output", "volume", "mute-toggle"],
+            "play_pause": ["wtype", "-k", "XF86AudioPlay"],
+            "next_track": ["wtype", "-k", "XF86AudioNext"],
+            "prev_track": ["wtype", "-k", "XF86AudioPrev"],
+        }
+        if action in media_map:
+            subprocess.run(media_map[action], capture_output=True)
+            play_sound(ACTION_CHIME)
+            set_hud_state("listening", 0.2)
+            return True
+
+        return False
+
+    def process_utterance(self, raw_text: str):
+        text = raw_text.strip()
+        if not text:
+            return
+
+        print(f"[InfinaEngine] Heard: '{text}'", flush=True)
+        clean = text.lower().strip(" .,!?")
+        self.last_activity_time = time.time()
+
+        # Fast Check 1: Dismiss alone
+        if clean in ["close", "dismiss", "thank you", "thanks", "bye", "goodbye", "sleep", "stop"]:
+            self.on_dismiss()
+            return
+
+        # Fast Check 2: Send alone
+        if re.match(r"^(?:send\s*(?:it)?|press\s+enter|hit\s+enter|submit)\.?!?$", clean):
+            print("[InfinaEngine] → Send (Enter)", flush=True)
+            press_return()
+            play_sound(ACTION_CHIME)
+            set_hud_state("listening", 0.2)
+            return
+
+        # Fast Check 3: Clear alone
+        if re.match(r"^(?:clear\s*(?:it|that|text)?|scratch\s+that|delete\s*that|undo)$", clean):
+            clear_input()
+            play_sound(ACTION_CHIME)
+            set_hud_state("listening", 0.2)
+            return
+
+        # Query Running Environment Context
+        clients = get_running_windows()
+        active_class = ""
+        try:
+            r = subprocess.run(["hyprctl", "activewindow", "-j"], capture_output=True, text=True)
+            if r.stdout:
+                active_class = json.loads(r.stdout).get("class", "")
+        except Exception:
+            pass
+        running_apps = list({c.get("class") for c in clients if c.get("class")})
+
+        # --- MULTI-TIER LLM DECISION (NVIDIA -> GROQ) ---
+        set_hud_state("thinking", 0.4)
+        decision = query_llm_intent(text, active_class, running_apps)
+
+        if decision and self.execute_llm_action(decision):
+            print(f"[InfinaEngine] LLM Action Executed: {decision}", flush=True)
+            return
+
+        # --- TIER 3 LOCAL DETERMINISTIC FALLBACK ---
+        print("[InfinaEngine] Using Tier 3 Local Rules Fallback", flush=True)
+
+        # Workspace
+        m_ws = re.match(r"^(?:go\s+to\s+)?(?:workspace|workstation|desktop|space)\s+(\w+)$", clean)
+        if m_ws:
+            ws = WORD_TO_NUM.get(m_ws.group(1), m_ws.group(1))
+            subprocess.run(["hyprctl", "dispatch", f'hl.dsp.focus({{ workspace = "{ws}" }})'], capture_output=True)
+            play_sound(ACTION_CHIME)
+            set_hud_state("listening", 0.2)
+            return
+
+        # Open / Focus
+        m_open = re.match(r"^(?:open|launch|focus|go\s+to|switch\s+to)\s+(?:the\s+)?([a-z0-9\-\_\s]+)$", clean)
+        if m_open and not m_open.group(1).startswith("typing"):
+            ok, label = focus_or_launch(m_open.group(1))
+            play_sound(ACTION_CHIME if ok else CLOSE_CHIME)
+            set_hud_state("listening", 0.2)
+            return
+
+        # Default: Type everything
+        prompt = re.sub(r"^(?:type|write|say|dictate)[\s,:\-\.]*", "", text, flags=re.IGNORECASE).strip()
+        has_send = bool(re.search(r"[\s,;\-]+(?:send\s*(?:it|now)?|press\s+enter)[\.!\?]*$", prompt, re.IGNORECASE))
+        if has_send:
+            prompt = re.sub(r"[\s,;\-]+(?:send\s*(?:it|now)?|press\s+enter)[\.!\?]*$", "", prompt, re.IGNORECASE).strip()
+
+        if prompt:
+            set_hud_state("speaking", 0.5)
+            paste_or_type(prompt)
+            if has_send:
+                press_return()
+            play_sound(ACTION_CHIME)
+
+        set_hud_state("listening", 0.1)
+
+    def process_audio(self, indata, frames, time_info, status):
+        audio_int16 = indata[:, 0]
+        now = time.time()
+        rms = float(np.sqrt(np.mean(audio_int16.astype(float)**2)))
+
+        if self.state == "COOLDOWN":
+            if now >= self.cooldown_until:
+                self.state = "IDLE"
+            return
+
+        if self.state == "IDLE":
+            self.ambient_rms = 0.95 * self.ambient_rms + 0.05 * rms
+            preds = self.oww.predict(
+                audio_int16,
+                patience={self.model_key: 2},
+                threshold={self.model_key: self.threshold}
+            )
+            score = preds.get(self.model_key, 0.0)
+            if score >= self.threshold:
+                print(f"[InfinaEngine] Wake-word detected (score={score:.2f})", flush=True)
+                self.on_wake()
+
+        elif self.state == "LISTENING":
+            self.audio_frames.extend(audio_int16.tobytes())
+            live_level = min(1.0, max(0.0, (rms - self.ambient_rms) / 1200.0))
+            set_hud_state("listening", live_level)
+
+            speech_threshold = max(200.0, self.ambient_rms * 2.0)
+            if rms > speech_threshold:
+                self.has_spoken = True
+                self.last_speech_time = now
+
+            if self.has_spoken and (now - self.last_speech_time >= 0.85):
+                self.state = "PROCESSING"
+                set_hud_state("thinking", 0.4)
+                captured = bytes(self.audio_frames)
+                self.audio_frames.clear()
+                self.has_spoken = False
+
+                transcript = transcribe_groq(captured)
+                if transcript:
+                    self.process_utterance(transcript)
+                else:
+                    set_hud_state("listening", 0.1)
+
+                if self.state == "PROCESSING":
+                    self.state = "LISTENING"
+                    self.last_speech_time = time.time()
+                    self.last_activity_time = time.time()
+                return
+
+            if now - self.last_activity_time > 90.0:
+                print("[InfinaEngine] Inactivity timeout (90s).", flush=True)
+                self.on_dismiss()
+
+    def run(self):
+        print(f"[InfinaEngine] Engine ready. Waiting for '{self.wake_word}'...", flush=True)
+        set_hud_state("disabled", 0.0)
+        with sd.InputStream(
+            samplerate=16000,
+            channels=1,
+            dtype="int16",
+            blocksize=1280,
+            callback=self.process_audio,
+        ):
+            while True:
+                time.sleep(0.5)
+
+
+if __name__ == "__main__":
+    daemon = InfinaEngine(wake_word="hey_jarvis", threshold=0.50)
+    daemon.run()
