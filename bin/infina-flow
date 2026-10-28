@@ -388,16 +388,6 @@ class InfinaEngine:
         except Exception as e:
             print(f"[InfinaEngine] HUD error: {e}", file=sys.stderr)
 
-    def reset_wakeword(self):
-        try:
-            self.oww.reset()
-            self.oww.preprocessor.raw_data_buffer.clear()
-            self.oww.preprocessor.melspectrogram_buffer.fill(0)
-            self.oww.preprocessor.feature_buffer.fill(0)
-            self.oww.preprocessor.accumulated_samples = 0
-        except Exception:
-            pass
-
     def on_wake(self):
         print(f"\n[InfinaEngine] Activated! Siri Wave Line awake.", flush=True)
         play_sound(WAKE_CHIME)
@@ -407,6 +397,7 @@ class InfinaEngine:
         self.state = "LISTENING"
         self.last_activity_time = time.time()
         self.last_speech_time = time.time()
+        self.wake_time = time.time()
         self.has_spoken = False
         self.audio_frames.clear()
 
@@ -415,9 +406,9 @@ class InfinaEngine:
         play_sound(CLOSE_CHIME)
         set_hud_state("disabled", 0.0)
         self.state = "COOLDOWN"
-        self.cooldown_until = time.time() + 1.5
-        self.reset_wakeword()
+        self.cooldown_until = time.time() + 0.8
         self.audio_frames.clear()
+        self.has_spoken = False
 
     def execute_llm_action(self, decision: dict) -> bool:
         """Executes a JSON action decided by NVIDIA or Groq LLM."""
@@ -526,12 +517,19 @@ class InfinaEngine:
         if not text:
             return
 
-        print(f"[InfinaEngine] Heard: '{text}'", flush=True)
         clean = text.lower().strip(" .,!?")
+
+        # Filter out Whisper silence/breath hallucinations (Whisper outputs "Thank you." on empty silence)
+        if clean in ["thank you", "thank you.", "thanks", "thanks for watching", "thank you for watching", "you", ""]:
+            print(f"[InfinaEngine] Ignored Whisper silence artifact: '{text}' (staying awake)", flush=True)
+            set_hud_state("listening", 0.1)
+            return
+
+        print(f"[InfinaEngine] Heard: '{text}'", flush=True)
         self.last_activity_time = time.time()
 
-        # Fast Check 1: Dismiss alone
-        if clean in ["close", "dismiss", "thank you", "thanks", "bye", "goodbye", "sleep", "stop"]:
+        # Dismiss only on explicit command words
+        if clean in ["close", "close assistant", "dismiss", "bye", "goodbye", "sleep", "go to sleep", "shut down", "exit"]:
             self.on_dismiss()
             return
 
@@ -627,11 +625,15 @@ class InfinaEngine:
                 self.on_wake()
 
         elif self.state == "LISTENING":
+            # Skip the first 0.35s after wake so the tail of 'Hey Jarvis' is not captured
+            if now - getattr(self, "wake_time", 0) < 0.35:
+                return
+
             self.audio_frames.extend(audio_int16.tobytes())
             live_level = min(1.0, max(0.0, (rms - self.ambient_rms) / 1200.0))
             set_hud_state("listening", live_level)
 
-            speech_threshold = max(200.0, self.ambient_rms * 2.0)
+            speech_threshold = max(220.0, self.ambient_rms * 2.2)
             if rms > speech_threshold:
                 self.has_spoken = True
                 self.last_speech_time = now
@@ -642,6 +644,12 @@ class InfinaEngine:
                 captured = bytes(self.audio_frames)
                 self.audio_frames.clear()
                 self.has_spoken = False
+
+                # Ignore tiny blips (<0.5s of audio)
+                if len(captured) < 16000:
+                    self.state = "LISTENING"
+                    set_hud_state("listening", 0.1)
+                    return
 
                 transcript = transcribe_groq(captured)
                 if transcript:
