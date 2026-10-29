@@ -368,7 +368,7 @@ def query_llm_intent(user_speech: str, active_win: str, running_apps: list[str])
 
 
 class InfinaEngine:
-    def __init__(self, wake_word="hey_jarvis", threshold=0.50):
+    def __init__(self, wake_word="hey_jarvis", threshold=0.35):
         self.wake_word = wake_word
         self.threshold = threshold
 
@@ -633,12 +633,8 @@ class InfinaEngine:
 
         if self.state == "IDLE":
             self.ambient_rms = 0.95 * self.ambient_rms + 0.05 * rms
-            preds = self.oww.predict(
-                audio_int16,
-                patience={self.model_key: 2},
-                threshold={self.model_key: self.threshold}
-            )
-            score = preds.get(self.model_key, 0.0)
+            preds = self.oww.predict(audio_int16)
+            score = float(preds.get(self.model_key, 0.0))
             if score >= self.threshold:
                 print(f"[InfinaEngine] Wake-word detected (score={score:.2f})", flush=True)
                 self.on_wake()
@@ -701,5 +697,5 @@ class InfinaEngine:
 
 
 if __name__ == "__main__":
-    daemon = InfinaEngine(wake_word="hey_jarvis", threshold=0.50)
+    daemon = InfinaEngine(wake_word="hey_jarvis", threshold=0.35)
     daemon.run()
