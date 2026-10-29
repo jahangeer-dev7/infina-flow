@@ -24,7 +24,7 @@ import urllib.request
 import urllib.error
 import difflib
 import numpy as np
-
+import base64
 VENV_PATH = os.path.expanduser("~/.local/share/vox-handsfree-venv")
 if os.path.exists(VENV_PATH):
     sys.path.insert(0, os.path.join(VENV_PATH, "lib/python3.14/site-packages"))
@@ -43,9 +43,11 @@ STATE_FILE = f"/run/user/{os.getuid()}/infina/state"
 # --- API Keys Loading ---
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 env_files = [
     os.path.expanduser("~/.config/voxtype/voxtype.env"),
+    os.path.expanduser("~/.config/voxtype/gemini.env"),
     os.path.expanduser("~/.config/infina-flow/infina.env"),
     "/etc/infina-flow.env",
 ]
@@ -61,6 +63,8 @@ for ef in env_files:
                         GROQ_API_KEY = line.split("=", 1)[1].strip("\"' ")
                     elif "NVIDIA_API_KEY" in line and not NVIDIA_API_KEY:
                         NVIDIA_API_KEY = line.split("=", 1)[1].strip("\"' ")
+                    elif "GEMINI_API_KEY" in line and not GEMINI_API_KEY:
+                        GEMINI_API_KEY = line.split("=", 1)[1].strip("\"' ")
         except Exception:
             pass
 
@@ -287,9 +291,76 @@ def clear_input():
     time.sleep(0.06)
     subprocess.run(["wtype", "-k", "BackSpace"])
 
+def click_element_on_screen(target_description: str) -> bool:
+    """Takes a screenshot, passes it to the Vision model to predict (x, y) coordinates, moves mouse and clicks."""
+    refresh_wayland_env()
+    shot_path = f"/tmp/infina_shot_{os.getuid()}.jpg"
+    try:
+        subprocess.run(["grim", "-t", "jpeg", "-q", "80", shot_path], check=True, timeout=2.0)
+    except Exception as e:
+        print(f"[InfinaEngine] Screenshot failed: {e}", file=sys.stderr)
+        return False
+
+    try:
+        r = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True, text=True)
+        m = json.loads(r.stdout)[0]
+        eff_w = m.get("width", 1920) / m.get("scale", 1.0)
+        eff_h = m.get("height", 1080) / m.get("scale", 1.0)
+    except Exception:
+        eff_w, eff_h = 1536, 864
+
+    if GEMINI_API_KEY:
+        try:
+            with open(shot_path, "rb") as f:
+                img_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+            prompt = f"Locate the element on screen: '{target_description}'. Return ONLY JSON: {{\"label\": \"...\", \"point\": [y, x]}} where y and x are normalized coordinates from 0 to 1000."
+            payload = {
+                "contents": [{
+                    "parts": [
+                        {"text": prompt},
+                        {"inline_data": {"mime_type": "image/jpeg", "data": img_b64}}
+                    ]
+                }],
+                "generationConfig": {"response_mime_type": "application/json"}
+            }
+            req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode())
+                text_res = data["candidates"][0]["content"]["parts"][0]["text"]
+                pred = json.loads(text_res)
+                norm_y, norm_x = pred["point"]
+                target_x = int((norm_x / 1000.0) * eff_w)
+                target_y = int((norm_y / 1000.0) * eff_h)
+                print(f"[InfinaEngine] Vision located '{target_description}' at ({target_x}, {target_y})", flush=True)
+
+                cur_pos = subprocess.run(["hyprctl", "cursorpos"], capture_output=True, text=True).stdout.strip()
+                cur_x, cur_y = [int(p.strip()) for p in cur_pos.split(",")]
+                dx = target_x - cur_x
+                dy = target_y - cur_y
+
+                import evdev
+                from evdev import UInput, ecodes as ec
+                capabilities = {ec.EV_REL: [ec.REL_X, ec.REL_Y], ec.EV_KEY: [ec.BTN_LEFT, ec.BTN_RIGHT]}
+                ui = UInput(capabilities, name="infina-virtual-mouse")
+                ui.write(ec.EV_REL, ec.REL_X, dx)
+                ui.write(ec.EV_REL, ec.REL_Y, dy)
+                ui.syn()
+                time.sleep(0.06)
+                ui.write(ec.EV_KEY, ec.BTN_LEFT, 1)
+                ui.syn()
+                time.sleep(0.06)
+                ui.write(ec.EV_KEY, ec.BTN_LEFT, 0)
+                ui.syn()
+                ui.close()
+                return True
+        except Exception as e:
+            print(f"[InfinaEngine] Vision grounding error: {e}", file=sys.stderr)
+
+    return False
 
 # --- LLM INTENT ROUTER WITH MULTI-TIER FALLBACK ---
-
 SYSTEM_INTENT_PROMPT = """You are a high-speed Linux desktop voice intent classifier.
 Active window: {active_win}
 Running apps: {running_apps}
@@ -306,6 +377,7 @@ Map the user's spoken words into a clean JSON action:
   - "reopen_tab": restore old/closed tabs ("restore the old tabs", "reopen tab", "restore closed tabs", "restore the old taps")
   - "next_tab", "prev_tab", "go_back", "go_forward", "refresh", "scroll_down", "scroll_up"
 - "media": Audio control. Keys: "action": "volume_up"|"volume_down"|"mute"|"play_pause"|"next_track"|"prev_track"
+- "click": User wants to click a link, button, or element on screen. Keys: "action": "click", "target": "<description of what to click, e.g. 'first site', 'submit button', 'search'>"
 - "clear": Delete active input text. Keys: "action": "clear"
 - "dismiss": Put assistant to sleep. ONLY when user explicitly says "close assistant", "goodbye", "thank you", "bye", "go to sleep". NEVER pick dismiss for browser or window commands!
 
@@ -425,21 +497,26 @@ class InfinaEngine:
         play_sound(CLOSE_CHIME)
         set_hud_state("disabled", 0.0)
         self.state = "COOLDOWN"
-        self.cooldown_until = time.time() + 0.8
+        self.cooldown_until = time.time() + 3.0
         self.audio_frames.clear()
         self.has_spoken = False
-
     def execute_llm_action(self, decision: dict) -> bool:
         """Executes a JSON action decided by NVIDIA or Groq LLM."""
         action = decision.get("action")
         target = decision.get("target")
         text = decision.get("text")
         send_it = decision.get("send_it", False)
-
         if action == "dismiss":
             self.on_dismiss()
             return True
 
+        if action == "click" and target:
+            print(f"[InfinaEngine] Vision Grounding: Finding element '{target}' to click...", flush=True)
+            set_hud_state("thinking", 0.6)
+            ok = click_element_on_screen(str(target))
+            play_sound(ACTION_CHIME if ok else CLOSE_CHIME)
+            set_hud_state("listening", 0.2)
+            return True
         if action == "focus_app" and target:
             ok, label = focus_or_launch(target)
             play_sound(ACTION_CHIME if ok else CLOSE_CHIME)
@@ -606,6 +683,16 @@ class InfinaEngine:
             set_hud_state("listening", 0.2)
             return
 
+        # Vision Click Fallback
+        m_click = re.match(r"^(?:click|press|tap)\s+(?:on\s+)?(.+)$", clean)
+        if m_click:
+            target_desc = m_click.group(1).strip()
+            print(f"[InfinaEngine] Local fallback vision click: '{target_desc}'", flush=True)
+            set_hud_state("thinking", 0.6)
+            ok = click_element_on_screen(target_desc)
+            play_sound(ACTION_CHIME if ok else CLOSE_CHIME)
+            set_hud_state("listening", 0.2)
+            return
         # Default: Type everything
         prompt = re.sub(r"^(?:type|write|say|dictate)[\s,:\-\.]*", "", text, flags=re.IGNORECASE).strip()
         has_send = bool(re.search(r"[\s,;\-]+(?:send\s*(?:it|now)?|press\s+enter)[\.!\?]*$", prompt, re.IGNORECASE))
